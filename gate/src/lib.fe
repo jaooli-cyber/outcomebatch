@@ -155,15 +155,27 @@ fn valid_error_string(_ data: ReturnData, _ length: u256) -> bool {
     if length < 68 {
         return false
     }
-    let offset = data.word_at(4)
-    if offset > 0xffffffffffffffff || offset > length - 36 {
+    if data.word_at(4) != 32 {
         return false
     }
-    let string_length = data.word_at(4 + offset)
-    if string_length > 0xffffffffffffffff {
+    let string_length = data.word_at(36)
+    if string_length > 0xffffffffffffffff || string_length > length - 68 {
         return false
     }
-    string_length <= length - offset - 36
+    let remainder = string_length % 32
+    let padding = if remainder == 0 { 0 } else { 32 - remainder }
+    if 68 + string_length + padding != length {
+        return false
+    }
+
+    var index: u256 = 0
+    while index < padding {
+        if data.byte_at(68 + string_length + index) != 0 {
+            return false
+        }
+        index += 1
+    }
+    true
 }
 
 fn build_report(_ index: usize, _ outcome: RawCallOutcome, _ ret: own MemBuffer) -> CallReport {
@@ -349,6 +361,17 @@ pub contract RawTarget {
                 var encoded = MemBuffer::alloc(allocation as usize)
                 encoded.write_word(offset: 0, value: (ERROR_STRING_SELECTOR as u256) << 224)
                 encoded.write_word(offset: 4, value: word)
+                encoded.truncate(length as usize)
+                raw.revert(data: encoded.span())
+            }
+            if mode == 6 {
+                let allocation = if length < 100 { 100 } else { length }
+                var encoded = MemBuffer::alloc(allocation as usize)
+                encoded.write_word(offset: 0, value: (ERROR_STRING_SELECTOR as u256) << 224)
+                encoded.write_word(offset: 4, value: 32)
+                encoded.write_word(offset: 36, value: word)
+                encoded[68] = 0x61
+                encoded[69] = 0xff
                 encoded.truncate(length as usize)
                 raw.revert(data: encoded.span())
             }
@@ -546,6 +569,12 @@ fn padded_raw_target_data(_ length: usize) -> Bytes {
     padded.copy_from(dest_offset: 0, source: encoded.span())
     Bytes::from_payload(source: padded.span())
 }
+fn padded_burner_data(_ length: usize) -> Bytes {
+    var padded = MemBuffer::alloc(length)
+    let encoded = encode_msg_calldata(BurnerMsg::Burn {})
+    padded.copy_from(dest_offset: 0, source: encoded.span())
+    Bytes::from_payload(source: padded.span())
+}
 
 fn make_call(_ target: Address, _ gas_limit: u256, _ value: Wei, _ data: Bytes) -> BatchCall {
     BatchCall { target, gas_limit, value, data }
@@ -667,12 +696,17 @@ fn standard_error_and_panic_boundaries() uses (evm: mut Evm) {
     let success_short = deploy_raw(0, word: 0xaabb << 240, length: 2, salt: 10)
     let error_67 = deploy_raw(2, word: 0, length: 67, salt: 11)
     let error_68 = deploy_raw(2, word: 0, length: 68, salt: 12)
-    let error_long = deploy_raw(2, word: 300, length: 368, salt: 13)
-    let error_bad_offset = deploy_raw(5, word: 64, length: 68, salt: 14)
-    let error_far_offset = deploy_raw(5, word: 288, length: 324, salt: 18)
-    let panic_35 = deploy_raw(3, word: 0x11, length: 35, salt: 15)
-    let panic_36 = deploy_raw(3, word: 0x12, length: 36, salt: 16)
-    let dispatch_target = evm.create2<CounterTarget>(value: Wei::zero(), args: (), salt: 17)
+    let error_long = deploy_raw(2, word: 300, length: 388, salt: 13)
+    let error_offset_zero = deploy_raw(5, word: 0, length: 68, salt: 14)
+    let error_unaligned = deploy_raw(5, word: 1, length: 68, salt: 15)
+    let error_bad_offset = deploy_raw(5, word: 64, length: 68, salt: 16)
+    let error_far_offset = deploy_raw(5, word: 288, length: 324, salt: 17)
+    let error_unpadded = deploy_raw(2, word: 1, length: 69, salt: 18)
+    let error_padded = deploy_raw(2, word: 1, length: 100, salt: 19)
+    let error_dirty_padding = deploy_raw(6, word: 1, length: 100, salt: 20)
+    let panic_35 = deploy_raw(3, word: 0x11, length: 35, salt: 21)
+    let panic_36 = deploy_raw(3, word: 0x12, length: 36, salt: 22)
+    let dispatch_target = evm.create2<CounterTarget>(value: Wei::zero(), args: (), salt: 23)
     let unknown_selector = Bytes::from_word_prefix(word: 0x12345678 << 224, len: 4)
 
     let reports = execute_calls(
@@ -683,8 +717,18 @@ fn standard_error_and_panic_boundaries() uses (evm: mut Evm) {
                 make_call(error_67, 300000, Wei::zero(), raw_target_data()),
                 make_call(error_68, 300000, Wei::zero(), raw_target_data()),
                 make_call(error_long, 300000, Wei::zero(), raw_target_data()),
+                make_call(error_offset_zero, 300000, Wei::zero(), raw_target_data()),
+                make_call(error_unaligned, 300000, Wei::zero(), raw_target_data()),
                 make_call(error_bad_offset, 300000, Wei::zero(), raw_target_data()),
                 make_call(error_far_offset, 300000, Wei::zero(), raw_target_data()),
+                make_call(error_unpadded, 300000, Wei::zero(), raw_target_data()),
+                make_call(error_padded, 300000, Wei::zero(), raw_target_data()),
+                make_call(
+                    error_dirty_padding,
+                    300000,
+                    Wei::zero(),
+                    raw_target_data(),
+                ),
                 make_call(panic_35, 300000, Wei::zero(), raw_target_data()),
                 make_call(panic_36, 300000, Wei::zero(), raw_target_data()),
                 make_call(dispatch_target, 300000, Wei::zero(), unknown_selector),
@@ -692,7 +736,7 @@ fn standard_error_and_panic_boundaries() uses (evm: mut Evm) {
         ),
         Wei::zero(),
     )
-    assert!(reports.len() == 9)
+    assert!(reports.len() == 14)
 
     let short_success = reports.get(0)
     assert!(short_success.success && short_success.class == 0)
@@ -713,34 +757,45 @@ fn standard_error_and_panic_boundaries() uses (evm: mut Evm) {
     let long_error = reports.get(3)
     assert!(!long_error.success && long_error.class == 3)
     assert!(
-        long_error.returndata_len == 368 && long_error.prefix.len() == PREFIX_CAP,
+        long_error.returndata_len == 388 && long_error.prefix.len() == PREFIX_CAP,
     )
     assert!(!long_error.hash_is_complete)
 
-    let bad_offset = reports.get(4)
+    let offset_zero = reports.get(4)
+    assert!(!offset_zero.success && offset_zero.class == 6)
+    let unaligned = reports.get(5)
+    assert!(!unaligned.success && unaligned.class == 6)
+    let bad_offset = reports.get(6)
     assert!(!bad_offset.success && bad_offset.class == 6)
-    assert!(bad_offset.selector == ERROR_STRING_SELECTOR)
 
-    let far_offset = reports.get(5)
-    assert!(!far_offset.success && far_offset.class == 3)
+    let far_offset = reports.get(7)
+    assert!(!far_offset.success && far_offset.class == 6)
     assert!(far_offset.returndata_len == 324)
     assert!(
         far_offset.prefix.len() == PREFIX_CAP && !far_offset.hash_is_complete,
     )
 
-    let short_panic = reports.get(6)
+    let unpadded = reports.get(8)
+    assert!(!unpadded.success && unpadded.class == 6)
+    let padded = reports.get(9)
+    assert!(!padded.success && padded.class == 3)
+    assert!(padded.returndata_len == 100 && padded.hash_is_complete)
+    let dirty_padding = reports.get(10)
+    assert!(!dirty_padding.success && dirty_padding.class == 6)
+
+    let short_panic = reports.get(11)
     assert!(!short_panic.success && short_panic.class == 6)
     assert!(
         short_panic.selector == PANIC_SELECTOR && !short_panic.panic_present,
     )
 
-    let exact_panic = reports.get(7)
+    let exact_panic = reports.get(12)
     assert!(!exact_panic.success && exact_panic.class == 4)
     assert!(
         exact_panic.panic_present && exact_panic.panic_code == 0x12,
     )
 
-    let no_handler = reports.get(8)
+    let no_handler = reports.get(13)
     assert!(!no_handler.success && no_handler.class == 1)
     assert!(
         no_handler.returndata_len == 0 && !no_handler.selector_present,
@@ -888,6 +943,67 @@ fn failure_continues_and_suffix_gas_is_preserved() uses (evm: mut Evm) {
         )
     assert!(hits_after == 1)
 }
+#[test]
+fn sixteen_exhausted_callees_at_max_total_data() uses (evm: mut Evm) {
+    let batch = deploy_batch(33)
+    let burner = evm.create2<Burner>(value: Wei::zero(), args: (), salt: 34)
+    assert!(burner != Address::zero())
+
+    let item = make_call(
+        burner,
+        100000,
+        Wei::zero(),
+        padded_burner_data(MAX_TOTAL_DATA / MAX_CALLS),
+    )
+    let reports = execute_calls(batch, dyn_array_from([item; 16]), Wei::zero())
+    assert!(reports.len() == 16)
+
+    var index: usize = 0
+    while index < reports.len() {
+        let report = reports.get(index)
+        assert!(report.index == index.downcast_truncate())
+        assert!(!report.success && report.class == 1)
+        assert!(report.returndata_len == 0 && report.prefix.len() == 0)
+        assert!(report.hash_is_complete)
+        index += 1
+    }
+}
+
+#[test]
+fn gas_admission_has_a_reject_and_accept_bracket() uses (evm: mut Evm) {
+    let batch = deploy_batch(35)
+    let counter = evm.create2<CounterTarget>(value: Wei::zero(), args: (), salt: 36)
+    let item = make_call(counter, 100000, Wei::zero(), counter_hit_data())
+
+    let rejected = evm
+        .try_call(
+            addr: batch,
+            gas: 600000,
+            value: Wei::zero(),
+            message: OutcomeBatchMsg::Execute { calls: dyn_array_from([item]) },
+        )
+    assert!(
+        !rejected.success() && is_error<InsufficientBatchGas>(rejected.returndata()),
+    )
+
+    let accepted = evm
+        .try_call(
+            addr: batch,
+            gas: 1200000,
+            value: Wei::zero(),
+            message: OutcomeBatchMsg::Execute { calls: dyn_array_from([item]) },
+        )
+    assert!(accepted.success())
+
+    let hits: u256 = evm
+        .call(
+            addr: counter,
+            gas: 100000,
+            value: Wei::zero(),
+            message: CounterTargetMsg::Hits {},
+        )
+    assert!(hits == 1)
+}
 
 #[test]
 fn return_bomb_is_capped() uses (evm: mut Evm) {
@@ -946,7 +1062,12 @@ fn maximum_report_abi_has_exact_sizes() uses (evm: mut Evm) {
         length: PREFIX_CAP as u256,
         salt: 51,
     )
-    let item = make_call(target, 150000, Wei::zero(), raw_target_data())
+    let item = make_call(
+        target,
+        150000,
+        Wei::zero(),
+        padded_raw_target_data(MAX_TOTAL_DATA / MAX_CALLS),
+    )
     let calls = dyn_array_from([item; 16])
 
     let typed = execute_calls(batch, calls, Wei::zero())
