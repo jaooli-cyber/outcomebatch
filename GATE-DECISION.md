@@ -45,3 +45,42 @@ At 2026-11-03T09:04Z the user required complete empirical checks of all three
 candidates and authorized low-priority work alongside unrelated shared-host
 jobs when aggregate resources are sufficient. This does not rewrite the
 original timebox result. The repository is reopened solely to determine
+whether the design is technically viable.
+
+## Later technical verdict
+
+**GO**
+
+The accepted source is commit
+`45fca58a425c57129dba32b8a8fe46e99bfaeacc`, tree
+`f58d265936a25833f043d6a95568abc123318222`, built with Fe 26.5.0.
+Fresh evidence establishes build exit 0, 11/11 tests, strict standard-error
+boundaries, a 16-call/32-KiB exhaustion workload, a 600k-reject/1.2m-accept
+gas bracket, capped return bombs, refund/reentrancy behavior and external ABI
+execution on Cancun with the expected Shanghai negative control.
+
+Evidence: `evidence/final2-20261103T093400Z`.
+Manifest SHA-256:
+`a71b463fba7378c51b64e5fb569d3683017aeb0ea640356d7753de84c3094c31`.
+Verification-log SHA-256:
+`20e2b648ce682bf3c2538f8658f9210f85e7ff3688c7ad60213841c589457153`.
+
+## Problems resolved
+
+1. Canonical-error validation now requires offset 32, exact padded length,
+   zero padding and exactly 36 panic bytes.
+2. The final trace combines maximum count, total input and gas exhaustion.
+3. The suite proves both rejection and acceptance around a measured gas
+   bracket.
+4. An isolated ethers/ethereumjs harness checks generated ABI, bytecode and
+   fork behavior.
+
+## Accepted S2 constraints
+
+Typed input caps run after ABI materialization; raw-call success does not prove
+target code; refund rejection atomically rolls back; Cancun+ is mandatory;
+gas constants are not a universal optimum; long returns hash only their copied
+prefix and expose `hash_is_complete = false`.
+
+No S0 or S1 remains open. OutcomeBatch is eligible for selection, but GO does
+not authorize simultaneous development. No GitHub remote is configured.

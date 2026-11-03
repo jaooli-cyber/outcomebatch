@@ -28,3 +28,37 @@
   having passed the original 00:30-03:00 UTC gate.
 - Runner limits: one Fe job, CPUs 6-7, one compiler/test worker, nice level 15,
   idle I/O priority, serial execution, no inspection or modification of
+  unrelated workloads.
+
+### Late empirical ledger
+
+- Commit `dd1ae89`: first late build passed its then-current 9/9 tests.
+  Red Team held PLAN B because combined maximum load, canonical error
+  boundaries, a gas bracket and external ABI/fork execution were not proven.
+- Commit `3f6e838`: added strict canonical `Error(string)`, adversarial
+  offset/length/padding vectors, 16 full-gas burners at 32 KiB total input and
+  a reject/accept gas bracket.
+- Commit `45fca58`: required exactly 36 bytes for `Panic(uint256)` and
+  added a 37-byte negative vector.
+- 2026-11-03T09:33:26Z: fresh final suite passed 11/11.
+- Maximum trace: exactly 16 target reverts and one outer success.
+- Gas trace: one low-gas outer rejection, one high-gas outer success and the
+  expected target/oracle calls.
+- Ethers 6.17.0 encoded selector `0x398f3653`. Ethereumjs-vm 10.1.3
+  executed and decoded the generated runtime on Cancun; Shanghai produced the
+  expected invalid opcode.
+
+## Later technical result
+
+- Commit: `45fca58a425c57129dba32b8a8fe46e99bfaeacc`.
+- Tree: `f58d265936a25833f043d6a95568abc123318222`.
+- Source SHA-256:
+  `2e8269b9e3b3b5a702e0c15f14085013df6293d09d4da7646f674606419e552a`.
+- Evidence: `evidence/final2-20261103T093400Z`.
+- Manifest SHA-256:
+  `a71b463fba7378c51b64e5fb569d3683017aeb0ea640356d7753de84c3094c31`.
+- Verification-log SHA-256:
+  `20e2b648ce682bf3c2538f8658f9210f85e7ff3688c7ad60213841c589457153`.
+- Later technical verdict: **GO**.
+
+This does not alter the fixed-window KILL above.
