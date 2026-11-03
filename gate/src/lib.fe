@@ -208,7 +208,7 @@ fn build_report(_ index: usize, _ outcome: RawCallOutcome, _ ret: own MemBuffer)
                     6
                 }
             } else if selector == PANIC_SELECTOR {
-                if full_length >= 36 {
+                if full_length == 36 {
                     class = 4
                     panic_present = true
                     panic_code = live.word_at(4)
@@ -706,7 +706,8 @@ fn standard_error_and_panic_boundaries() uses (evm: mut Evm) {
     let error_dirty_padding = deploy_raw(6, word: 1, length: 100, salt: 20)
     let panic_35 = deploy_raw(3, word: 0x11, length: 35, salt: 21)
     let panic_36 = deploy_raw(3, word: 0x12, length: 36, salt: 22)
-    let dispatch_target = evm.create2<CounterTarget>(value: Wei::zero(), args: (), salt: 23)
+    let panic_37 = deploy_raw(3, word: 0x13, length: 37, salt: 23)
+    let dispatch_target = evm.create2<CounterTarget>(value: Wei::zero(), args: (), salt: 24)
     let unknown_selector = Bytes::from_word_prefix(word: 0x12345678 << 224, len: 4)
 
     let reports = execute_calls(
@@ -731,12 +732,13 @@ fn standard_error_and_panic_boundaries() uses (evm: mut Evm) {
                 ),
                 make_call(panic_35, 300000, Wei::zero(), raw_target_data()),
                 make_call(panic_36, 300000, Wei::zero(), raw_target_data()),
+                make_call(panic_37, 300000, Wei::zero(), raw_target_data()),
                 make_call(dispatch_target, 300000, Wei::zero(), unknown_selector),
             ],
         ),
         Wei::zero(),
     )
-    assert!(reports.len() == 14)
+    assert!(reports.len() == 15)
 
     let short_success = reports.get(0)
     assert!(short_success.success && short_success.class == 0)
@@ -795,7 +797,10 @@ fn standard_error_and_panic_boundaries() uses (evm: mut Evm) {
         exact_panic.panic_present && exact_panic.panic_code == 0x12,
     )
 
-    let no_handler = reports.get(13)
+    let trailing_panic = reports.get(13)
+    assert!(!trailing_panic.success && trailing_panic.class == 6)
+
+    let no_handler = reports.get(14)
     assert!(!no_handler.success && no_handler.class == 1)
     assert!(
         no_handler.returndata_len == 0 && !no_handler.selector_present,
