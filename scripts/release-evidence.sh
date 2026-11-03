@@ -56,6 +56,7 @@ cp -R -- "$BUILD_DIR"/. "$stage/build/"
 
 {
   printf 'project=OutcomeBatch\n'
+  printf "project_id=%s\n" "$PROJECT_ID"
   printf 'label=%s\n' "$label"
   printf 'commit=%s\n' "$commit"
   printf 'tree=%s\n' "$tree"
@@ -91,7 +92,7 @@ cp -R -- "$BUILD_DIR"/. "$stage/build/"
   done
 ) > "$stage/SHA256SUMS"
 
-bundle_name="OutcomeBatch-evidence-$label.tar.gz"
+bundle_name="${PROJECT_ID}-evidence-$label.tar.gz"
 bundle="$output_root/$bundle_name"
 (
   cd "$stage"
