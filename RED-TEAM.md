@@ -15,7 +15,7 @@ non-reentrancy and unambiguous classification.
 | OB-01 | S0 | Alternate offsets, unpadded data or dirty padding could look like canonical `Error(string)`. | Require offset 32, exact padded total and zero padding; adversarial vectors added. | Closed |
 | OB-02 | S1 | `Panic(uint256)` with trailing bytes was accepted. | Require exactly 36 bytes; 37-byte negative vector added. | Closed |
 | OB-03 | S1 | Initial suite omitted maximum count + total data + exhaustion together. | 16 burners of 2,048 bytes; trace proves 16 reverts and outer success. | Closed |
-| OB-04 | S1 | Gas admission had no empirical bracket. | Same workload rejects at 600k and accepts at 1.2m. | Closed |
+| OB-04 | S1 | Gas admission had no empirical bracket. | A separate one-call bracket rejects at 600k and accepts at 1.2m. | Closed |
 | OB-05 | S1 | ABI/runtime/fork assumptions lacked an independent check. | Ethers encoding, Cancun execution and Shanghai negative control. | Closed |
 | OB-06 | S1 | A return bomb could cause proportional copying. | 256/257-byte and 1-MiB tests prove a 256-byte copy cap. | Closed |
 | OB-07 | S1 | Reentrancy or failed refund could leave partial effects. | Guard and hostile-refund tests prove clearing and rollback. | Closed |
