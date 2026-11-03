@@ -1,6 +1,6 @@
 # Ingot config
 [ingot]
-name = "outcomebatch_gate"
+name = "outcomebatch"
 version = "0.1.0"
 
 # Optional dependencies
