@@ -1,50 +1,96 @@
 # OutcomeBatch
 
-OutcomeBatch is a bounded payable batch executor written in Fe. It continues
-after individual call failures and returns a compact structured report.
+OutcomeBatch is a bounded diagnostic batch executor written in Fe. It executes every admitted EVM call exactly once, continues after individual failures, and returns compact reports without copying unbounded return data.
 
-Work here began after 2026-11-03 00:00:00 UTC. Precontest research and AI
-assistance are disclosed; no precontest implementation or pseudocode was
-copied here.
+Its purpose is observability under adversarial failure, not atomic multicall. A target may revert, burn its forwarded gas, return malformed standard errors, or produce a return-data bomb; OutcomeBatch preserves enough gas for later calls and for the final report.
 
-## Status
+## Why this is a Fe project
 
-- Historical fixed-window gate (00:30-03:00 UTC): **KILL**, because the
-  empirical run did not start under the original resource-isolation rule.
-- Later user-authorized technical assessment: **GO**.
-- Evaluated commit:
-  `45fca58a425c57129dba32b8a8fe46e99bfaeacc`.
-- Fe 26.5.0 (`3dab95f`): build succeeds and 11/11 tests pass.
-- The late GO proves technical viability; it neither rewrites the historical
-  result nor starts this candidate automatically.
+The core behavior is implemented in Fe and exercises Fe 26.5.0 primitives directly:
 
-## Bounds and semantics
+- RawCallOutcome and ephemeral ReturnData for raw EVM outcomes;
+- a 256-byte MemBuffer capture bound per call;
+- MemVec and dynamic ABI output for structured reports;
+- has_min_gas plus an EIP-150-aware suffix reserve;
+- Wei for exact funding and failed-call refunds;
+- TSlot transient storage for a Cancun reentrancy guard;
+- typed custom errors and a stable execute ABI.
 
-- Maximum 16 calls, 4,096 bytes per call and 32,768 input bytes total.
-- Maximum 256 copied return-data bytes per report.
-- Exact funding is required. Failed-call value is refunded after the batch;
-  refund rejection atomically reverts the whole batch.
-- EIP-1153 transient storage blocks reentrancy.
-- Reports distinguish empty, short, canonical `Error(string)`, exact
-  `Panic(uint256)`, other selectors and malformed standard errors.
-- The gas recurrence reserves for the suffix, final report and refund.
+This is not a wrapper around atomic multicall. The Fe contract owns admission, execution, bounded capture, conservative classification, refund policy, and report construction.
 
-## Evidence and limitations
+## Quick start
 
-Bundle: `evidence/final2-20261103T093400Z`.
+Requirements: Linux x86-64, curl, sha256sum, make, Node.js 20 or newer, and npm.
 
-- Manifest SHA-256:
-  `a71b463fba7378c51b64e5fb569d3683017aeb0ea640356d7753de84c3094c31`.
-- Verification-log SHA-256:
-  `20e2b648ce682bf3c2538f8658f9210f85e7ff3688c7ad60213841c589457153`.
-- Maximum trace: 16 exhausted targets at 32 KiB, all reported, outer success.
-- Gas bracket: 600,000 rejects and 1,200,000 accepts.
-- Ethers selector: `0x398f3653`; actual runtime succeeds on Cancun and
-  produces the expected invalid opcode on Shanghai.
+    make setup
+    make demo
 
-Typed ABI materializes dynamic input before contract bounds, so these are
-post-decode product bounds, not a calldata firewall. Raw EVM call success does
-not prove target code. Cancun+ is mandatory. The gas bracket is not a
-universal minimum-gas claim.
+The setup step downloads the official Fe 26.5.0 Linux binary, verifies its SHA-256, and installs the pinned demo dependencies. The demo then builds fresh artifacts, deploys OutcomeBatch on an in-memory Cancun EVM, sends a non-empty adversarial batch, decodes every report with Ethers, and compares the normalized result with a committed golden.
 
-See `GATE-DECISION.md`, `RED-TEAM.md` and `TEST-MATRIX.md`.
+For the complete local check:
+
+    make verify
+
+The verification path runs the Fe tests serially, checks the ABI and runtime-size bound, and runs the external EVM demo. After make setup, build, test, demo, and verification do not require network access.
+
+## Bounds
+
+| Property | Bound |
+|---|---:|
+| Calls per batch | 16 |
+| Calldata per call | 4,096 bytes |
+| Aggregate calldata | 32,768 bytes |
+| Copied return-data prefix | 256 bytes per call |
+| Target environment | Cancun or later |
+
+These input limits are product bounds enforced after typed ABI decoding. They are not pre-decode calldata bounds and OutcomeBatch is not a calldata firewall.
+
+## Report classes
+
+| Class | Meaning |
+|---:|---|
+| 0 | successful EVM CALL |
+| 1 | empty revert |
+| 2 | revert shorter than four bytes |
+| 3 | canonical Error(string) layout |
+| 4 | exact 36-byte Panic(uint256) |
+| 5 | other selector-bearing revert |
+| 6 | malformed Error(string) or Panic payload |
+
+Classification is deliberately conservative. A canonical Error(string) report describes ABI layout; it does not claim that the string bytes are valid UTF-8. A successful CALL does not prove that the target contains code.
+
+The prefix_hash field is Keccak-256 of the copied prefix. When hash_is_complete is false, it is not a hash of the full return value.
+
+## Funding and failure semantics
+
+The caller supplies the exact sum of all requested values. Value belonging to failed target calls is refunded after the batch. If the caller rejects that refund, the complete transaction reverts, including earlier target effects.
+
+requested_gas is the amount requested from CALL. EVM value-transfer rules may add a stipend when value is non-zero, so it is not an absolute cap on all gas available to a callee. The reserve constants are tested safety parameters for the pinned toolchain and fork, not universal minimum-gas claims.
+
+## Project map
+
+- src/lib.fe — contract, adversarial test targets, and Fe integration tests;
+- demo/ — independent Ethers and EthereumJS deployment/decoding demo;
+- scripts/ and Makefile — pinned reproducible commands;
+- DESIGN.md — algorithms, ABI, gas recurrence, and report semantics;
+- SECURITY.md — threat model, guarantees, and explicit limitations;
+- PROVENANCE.md — build-window history, reused material, and AI disclosure;
+- JUDGING.md — concise guide to the contest criteria.
+
+## Reproducibility
+
+The repository pins Fe 26.5.0, release commit 3dab95f8eebdccf9a2382bb59a33f7bbd03540ca, and the official Linux binary SHA-256:
+
+    3732fbe8a6e9d2ea3925d02d0e3a1478bc1e01d742c2be75d3ea7300c46c45f0
+
+Candidate evidence is generated from a clean tree and contains source hashes, artifact hashes, normalized verification output, ABI, bytecode, runtime bytecode, and an EIP-170 size check.
+
+## Scope
+
+OutcomeBatch is a contest prototype and has not received a production security audit. It intentionally does not provide target allowlists, pre-decode parsing, full return-data hashing, arbitrary string decoding, code-existence checks, universal gas calibration, deployment automation, or a user interface.
+
+See SECURITY.md before integrating it.
+
+## License
+
+Apache-2.0. See LICENSE.
