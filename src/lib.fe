@@ -32,7 +32,12 @@ const ERROR_STRING_SELECTOR: u32 = 0x08c379a0
 const PANIC_SELECTOR: u32 = 0x4e487b71
 
 #[abi]
-pub struct BatchCall { pub target: Address, pub gas_limit: u256, pub value: Wei, pub data: Bytes }
+pub struct BatchCall {
+    pub target: Address,
+    pub requested_gas: u256,
+    pub value: Wei,
+    pub data: Bytes,
+}
 impl Copy for BatchCall {}
 
 #[abi]
@@ -102,7 +107,7 @@ fn build_reserves(_ calls: MemSlice<BatchCall>) -> [u256; 16] {
         let current = calls[remaining]
         suffix = saturating_add(
             BETWEEN_CALL_RESERVE,
-            admission_requirement(current.gas_limit, suffix),
+            admission_requirement(current.requested_gas, suffix),
         )
     }
     reserves
@@ -267,7 +272,7 @@ pub contract OutcomeBatch {
             while index < count {
                 let item = items[index]
                 let target = item.target
-                let minimum = item.gas_limit
+                let minimum = item.requested_gas
                 let value = item.value
                 let args = item.data.payload_span()
 
@@ -330,6 +335,7 @@ pub contract RawTarget {
     }
 
     recv RawTargetMsg {
+        #[payable]
         Run uses (mode, word, length, raw: mut RawOps) {
             if mode == 2 {
                 let total = if length == 0 { 68 } else { length }
@@ -445,6 +451,14 @@ pub contract ValueSink uses (ctx: Ctx) {
         }
     }
 }
+pub contract StipendTarget {
+    init() {}
+
+    recv {
+        #[payable]
+        _ {}
+    }
+}
 
 msg ReentrantTargetMsg {
     #[selector = sol("attack()")]
@@ -537,6 +551,57 @@ pub contract ValueCaller uses (ctx: Ctx) {
         _ {}
     }
 }
+msg MaxRefundCallerMsg {
+    #[selector = sol("launch(address,address)")]
+    Launch { batch: Address, target: Address } -> (u256, u256, u256, bool),
+}
+
+pub contract MaxRefundCaller uses (ctx: Ctx) {
+    #[payable]
+    init()
+    {}
+
+    recv {
+        MaxRefundCallerMsg::Launch { batch, target } -> (u256, u256, u256, bool)
+        uses (ctx, call: mut Call)
+        {
+            let item = make_call(
+                target,
+                150000,
+                wei(1),
+                padded_raw_target_data(MAX_TOTAL_DATA / MAX_CALLS),
+            )
+            let reports: DynArray<CallReport> = call
+                .call(
+                    addr: batch,
+                    gas: 15000000,
+                    value: wei(16),
+                    message: OutcomeBatchMsg::Execute { calls: dyn_array_from([item; 16]) },
+                )
+            var all_failed_and_bounded = true
+            var index: usize = 0
+            while index < reports.len() {
+                let report = reports.get(index)
+                if report.success
+                    || report.returndata_len != 257
+                    || report.prefix.len() != PREFIX_CAP
+                    || report.hash_is_complete {
+                    all_failed_and_bounded = false
+                }
+                index += 1
+            }
+            (
+                reports.len() as u256,
+                reports.encoded_size() as u256,
+                ctx.selfbalance().as_wei(),
+                all_failed_and_bounded,
+            )
+        }
+
+        #[payable]
+        _ {}
+    }
+}
 
 fn raw_target_data() -> Bytes {
     let encoded = encode_msg_calldata(RawTargetMsg::Run {})
@@ -576,8 +641,8 @@ fn padded_burner_data(_ length: usize) -> Bytes {
     Bytes::from_payload(source: padded.span())
 }
 
-fn make_call(_ target: Address, _ gas_limit: u256, _ value: Wei, _ data: Bytes) -> BatchCall {
-    BatchCall { target, gas_limit, value, data }
+fn make_call(_ target: Address, _ requested_gas: u256, _ value: Wei, _ data: Bytes) -> BatchCall {
+    BatchCall { target, requested_gas, value, data }
 }
 
 fn deploy_batch(_ salt: u256) -> Address uses (evm: mut Evm) {
@@ -657,6 +722,8 @@ fn classification_boundaries() uses (evm: mut Evm) {
         !empty.success && empty.class == 1 && !empty.selector_present,
     )
     assert!(empty.returndata_len == 0 && empty.prefix.len() == 0)
+    assert!(empty.hash_is_complete)
+    assert!(empty.prefix_hash.val == keccak256(MemSpan::empty()))
 
     let short = reports.get(2)
     assert!(
@@ -1009,6 +1076,83 @@ fn gas_admission_has_a_reject_and_accept_bracket() uses (evm: mut Evm) {
         )
     assert!(hits == 1)
 }
+#[test(balance = 10)]
+fn requested_gas_value_stipend_is_explicit() uses (evm: mut Evm) {
+    let batch = deploy_batch(39)
+    let target = evm.create2<StipendTarget>(value: Wei::zero(), args: (), salt: 40)
+    assert!(target != Address::zero())
+
+    let without_value = execute_calls(
+        batch,
+        dyn_array_from([make_call(target, 0, Wei::zero(), Bytes::empty())]),
+        Wei::zero(),
+    )
+    assert!(without_value.len() == 1)
+    assert!(!without_value.get(0).success)
+    assert!(without_value.get(0).class == 1)
+    assert!(evm.balance(target) == Wei::zero())
+
+    let with_value = execute_calls(
+        batch,
+        dyn_array_from([make_call(target, 0, wei(1), Bytes::empty())]),
+        wei(1),
+    )
+    assert!(with_value.len() == 1)
+    assert!(with_value.get(0).success)
+    assert!(with_value.get(0).class == 0)
+    assert!(evm.balance(target) == wei(1))
+    assert!(evm.balance(batch) == Wei::zero())
+}
+#[test]
+fn funding_and_reserve_overflow_reject_before_call() uses (evm: mut Evm) {
+    let batch = deploy_batch(37)
+    let counter = evm.create2<CounterTarget>(value: Wei::zero(), args: (), salt: 38)
+    assert!(counter != Address::zero())
+    let maximum = !0 as u256
+
+    let overflow = evm
+        .try_call(
+            addr: batch,
+            gas: 2000000,
+            value: Wei::zero(),
+            message: OutcomeBatchMsg::Execute {
+                calls: dyn_array_from(
+                    [
+                        make_call(counter, 100000, wei(maximum), counter_hit_data()),
+                        make_call(counter, 100000, wei(1), counter_hit_data()),
+                    ],
+                ),
+            },
+        )
+    assert!(!overflow.success())
+    let overflow_data = overflow.returndata()
+    assert!(is_error<FundingOverflow>(overflow_data))
+    assert!(overflow_data.word_at(4) == 1)
+
+    let saturated = evm
+        .try_call(
+            addr: batch,
+            gas: 2000000,
+            value: Wei::zero(),
+            message: OutcomeBatchMsg::Execute {
+                calls: dyn_array_from(
+                    [make_call(counter, maximum, Wei::zero(), counter_hit_data())],
+                ),
+            },
+        )
+    assert!(
+        !saturated.success() && is_error<InsufficientBatchGas>(saturated.returndata()),
+    )
+
+    let hits: u256 = evm
+        .call(
+            addr: counter,
+            gas: 100000,
+            value: Wei::zero(),
+            message: CounterTargetMsg::Hits {},
+        )
+    assert!(hits == 0)
+}
 
 #[test]
 fn return_bomb_is_capped() uses (evm: mut Evm) {
@@ -1056,6 +1200,12 @@ fn return_bomb_is_capped() uses (evm: mut Evm) {
     assert!(!bomb_report.hash_is_complete)
     assert!(bomb_report.prefix.byte_at(255) == 0xa5)
     assert!(bomb_report.prefix_hash.val == expected_hash)
+    assert!(
+        exact_report.prefix_hash.val == over_report.prefix_hash.val,
+    )
+    assert!(over_report.prefix_hash.val == bomb_report.prefix_hash.val)
+    assert!(exact_report.returndata_len != over_report.returndata_len)
+    assert!(over_report.returndata_len != bomb_report.returndata_len)
 }
 
 #[test]
@@ -1157,6 +1307,30 @@ fn exact_funding_self_value_and_refund() uses (evm: mut Evm) {
     assert!(evm.balance(caller) == wei(17))
     assert!(evm.balance(sink) == wei(20))
     assert!(evm.balance(reverter) == Wei::zero())
+    assert!(evm.balance(batch) == Wei::zero())
+}
+#[test(balance = 100)]
+fn maximum_reports_refund_and_final_return_share_one_path()
+uses (evm: mut Evm)
+{
+    let batch = deploy_batch(64)
+    let target = deploy_raw(1, word: 0xdeadbeef << 224, length: 257, salt: 65)
+    let caller = evm.create2<MaxRefundCaller>(value: wei(16), args: (), salt: 66)
+    assert!(target != Address::zero() && caller != Address::zero())
+
+    let result: (u256, u256, u256, bool) = evm
+        .call(
+            addr: caller,
+            gas: 20000000,
+            value: Wei::zero(),
+            message: MaxRefundCallerMsg::Launch { batch, target },
+        )
+    assert!(result.0 == 16)
+    assert!(result.1 == 10784)
+    assert!(result.2 == 16)
+    assert!(result.3)
+    assert!(evm.balance(caller) == wei(16))
+    assert!(evm.balance(target) == Wei::zero())
     assert!(evm.balance(batch) == Wei::zero())
 }
 
