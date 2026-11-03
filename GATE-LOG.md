@@ -1,5 +1,7 @@
 # OutcomeBatch viability gate
 
+> **Historical record:** This file preserves the original gate ledger. For the current product state, use README.md and TEST-MATRIX.md.
+
 - Gate window: 2026-11-03 00:30:00-03:00:00 UTC.
 - Gate started on time at 2026-11-03T00:30:35Z.
 - Toolchain: Fe 26.5.0 (3dab95f), isolated project-local binary.

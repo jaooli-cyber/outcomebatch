@@ -1,5 +1,7 @@
 # OutcomeBatch gate decision
 
+> **Historical record:** This file preserves the original gate timebox and later reassessment. For the current product state, use README.md and TEST-MATRIX.md.
+
 ## Verdict
 
 `KILL`
@@ -36,7 +38,7 @@ This verdict records an incomplete empirical gate caused by resource contention 
 
 - No GitHub remote is configured.
 - OutcomeBatch remains in its own directory, Git history, toolchain, source, tests and evidence ledger.
-- Nothing from this project may be shared with DualClear or Calldata Firewall.
+- Nothing from this project may be shared with other contest entries.
 - Status after this decision: frozen and abandoned; no further development.
 
 ## Later user-authorized technical reassessment

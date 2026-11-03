@@ -1,8 +1,0 @@
-# Ingot config
-[ingot]
-name = "outcomebatch_gate"
-version = "0.1.0"
-
-# Optional dependencies
-# [dependencies]
-# utils = { path = "../utils" }
