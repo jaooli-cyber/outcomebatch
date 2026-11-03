@@ -1,0 +1,48 @@
+{
+  "selector": "0x398f3653",
+  "reports": [
+    {
+      "label": "success",
+      "index": 0,
+      "success": true,
+      "class": 0,
+      "selector_present": true,
+      "selector": "0x00000000",
+      "panic_present": false,
+      "panic_code": "0",
+      "returndata_len": "32",
+      "prefix": {"hex": "0x000000000000000000000000000000000000000000000000000000000000002a"},
+      "prefix_hash": "0xbeced09521047d05b8960b7e7bcc1d1292cf3e4b2a6b63f48335cbde5f7545d2",
+      "hash_is_complete": true
+    },
+    {
+      "label": "custom-revert",
+      "index": 1,
+      "success": false,
+      "class": 5,
+      "selector_present": true,
+      "selector": "0xdeadbeef",
+      "panic_present": false,
+      "panic_code": "0",
+      "returndata_len": "4",
+      "prefix": {"hex": "0xdeadbeef"},
+      "prefix_hash": "0xd4fd4e189132273036449fc9e11198c739161b4c0116a9a2dccdfa1c492006f1",
+      "hash_is_complete": true
+    },
+    {
+      "label": "returndata-bomb",
+      "index": 2,
+      "success": true,
+      "class": 0,
+      "selector_present": true,
+      "selector": "0x00000000",
+      "panic_present": false,
+      "panic_code": "0",
+      "returndata_len": "1048576",
+      "prefix": {"repeat": "00", "bytes": 256},
+      "prefix_hash": "0xd397b3b043d87fcd6fad1291ff0bfd16401c274896d8c63a923727f077b8e0b5",
+      "hash_is_complete": false
+    }
+  ],
+  "shanghai_error": "invalid opcode"
+}

@@ -1,0 +1,46 @@
+name: candidate-tag
+
+on:
+  push:
+    tags:
+      - 'fe-*-submission-v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: outcomebatch-candidate-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  candidate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out candidate tag and history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+
+      - name: Install pinned Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: '22.22.0'
+
+      - name: Install and verify pinned dependencies
+        run: make setup
+
+      - name: Verify tagged candidate from a clean clone
+        env:
+          CANDIDATE_TAG: ${{ github.ref_name }}
+          REQUIRE_DEMO: '1'
+        run: make candidate
+
+      - name: Upload deterministic release evidence
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: outcomebatch-candidate-${{ github.ref_name }}
+          path: evidence/release/
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0

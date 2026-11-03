@@ -20,7 +20,7 @@ This is not a wrapper around atomic multicall. The Fe contract owns admission, e
 
 ## Quick start
 
-Requirements: Linux x86-64, curl, sha256sum, make, Node.js 20 or newer, and npm.
+Requirements: Linux x86-64, curl, sha256sum, make, Node.js 20.19 or newer, and npm.
 
     make setup
     make demo
@@ -50,7 +50,7 @@ These input limits are product bounds enforced after typed ABI decoding. They ar
 | Class | Meaning |
 |---:|---|
 | 0 | successful EVM CALL |
-| 1 | empty revert |
+| 1 | failed CALL with empty returndata |
 | 2 | revert shorter than four bytes |
 | 3 | canonical Error(string) layout |
 | 4 | exact 36-byte Panic(uint256) |

@@ -2,7 +2,3 @@
 [ingot]
 name = "outcomebatch"
 version = "0.1.0"
-
-# Optional dependencies
-# [dependencies]
-# utils = { path = "../utils" }
