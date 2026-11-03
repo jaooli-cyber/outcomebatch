@@ -16,3 +16,15 @@
 - 2026-11-03T03:00:14Z: the gate window closed while the unrelated heavy processes were still active (two `python3` processes and one `fe` process, each consuming approximately one CPU). Only process name, resource use, state and elapsed time were observed; their arguments and paths were not inspected, and they were neither modified nor stopped.
 - Backend compilation and runtime tests were therefore not run inside the gate window. Static parser/type-check evidence is not a substitute for the required empirical backend/runtime evidence.
 - Final gate result: `KILL` (empirical gate not completed within its fixed window under the resource-isolation rules). This is not evidence that the design is technically impossible; it is enforcement of the predeclared viability rule.
+
+## Post-window technical verification
+
+- 2026-11-03T09:04Z: the user explicitly superseded the conservative
+  stop-on-shared-work rule and required complete empirical verification of all
+  three isolated candidates when aggregate host resources are sufficient.
+- The original timebox verdict above remains part of the audit trail.
+- OutcomeBatch is reopened only for a late technical viability assessment;
+  evidence obtained now is labelled post-window and cannot be represented as
+  having passed the original 00:30-03:00 UTC gate.
+- Runner limits: one Fe job, CPUs 6-7, one compiler/test worker, nice level 15,
+  idle I/O priority, serial execution, no inspection or modification of

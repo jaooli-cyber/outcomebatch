@@ -38,3 +38,10 @@ This verdict records an incomplete empirical gate caused by resource contention 
 - OutcomeBatch remains in its own directory, Git history, toolchain, source, tests and evidence ledger.
 - Nothing from this project may be shared with DualClear or Calldata Firewall.
 - Status after this decision: frozen and abandoned; no further development.
+
+## Later user-authorized technical reassessment
+
+At 2026-11-03T09:04Z the user required complete empirical checks of all three
+candidates and authorized low-priority work alongside unrelated shared-host
+jobs when aggregate resources are sufficient. This does not rewrite the
+original timebox result. The repository is reopened solely to determine
