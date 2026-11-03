@@ -1,5 +1,7 @@
 # OutcomeBatch
 
+Contest registration: **FE-016**.
+
 OutcomeBatch is a bounded diagnostic batch executor written in Fe. It executes every admitted EVM call exactly once, continues after individual failures, and returns compact reports without copying unbounded return data.
 
 Its purpose is observability under adversarial failure, not atomic multicall. A target may revert, burn its forwarded gas, return malformed standard errors, or produce a return-data bomb; OutcomeBatch preserves enough gas for later calls and for the final report.
@@ -75,7 +77,8 @@ requested_gas is the amount requested from CALL. EVM value-transfer rules may ad
 - DESIGN.md — algorithms, ABI, gas recurrence, and report semantics;
 - SECURITY.md — threat model, guarantees, and explicit limitations;
 - PROVENANCE.md — build-window history, reused material, and AI disclosure;
-- JUDGING.md — concise guide to the contest criteria.
+- JUDGING.md — concise guide to the contest criteria;
+- SUBMISSION.md — public, non-secret submission fields and candidate-tag procedure.
 
 ## Reproducibility
 

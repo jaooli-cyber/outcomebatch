@@ -3,10 +3,13 @@ set -euo pipefail
 source "$(dirname -- "$0")/common.sh"
 
 tag="${CANDIDATE_TAG:-}"
-[[ "$tag" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "set CANDIDATE_TAG to the annotated submission tag"
+[[ "$tag" == "$CANDIDATE_TAG_EXPECTED" ]] || die "CANDIDATE_TAG must be $CANDIDATE_TAG_EXPECTED"
 [[ -z "$(git -C "$ROOT" status --porcelain=v1 --untracked-files=all)" ]] || die "candidate worktree must be clean"
 
 head="$(git -C "$ROOT" rev-parse HEAD)"
+main_head="$(git -C "$ROOT" ls-remote --exit-code origin refs/heads/main | cut -f1)"
+[[ "$main_head" == "$head" ]] || die "candidate HEAD must equal origin/main"
+
 [[ "$(git -C "$ROOT" cat-file -t "refs/tags/$tag" 2>/dev/null || true)" == "tag" ]] || die "candidate tag must be annotated"
 [[ "$(git -C "$ROOT" rev-parse "refs/tags/$tag^{}")" == "$head" ]] || die "candidate tag does not peel to HEAD"
 
@@ -42,7 +45,7 @@ git -C "$clone" checkout --quiet "$tag"
   EVIDENCE_RUN=pass2 ./scripts/release-evidence.sh "$tag"
 )
 
-bundle_name="OutcomeBatch-evidence-$tag.tar.gz"
+bundle_name="${PROJECT_ID}-evidence-$tag.tar.gz"
 bundle1="$clone/evidence/pass1/$bundle_name"
 bundle2="$clone/evidence/pass2/$bundle_name"
 cmp -- "$bundle1" "$bundle2" || die "independent evidence generations differ"
@@ -56,10 +59,20 @@ cp -- "$bundle1" "$release_dir/$bundle_name"
   cd "$release_dir"
   sha256sum -- "$bundle_name" > "$bundle_name.sha256"
 )
-cp -- "$clone/evidence/pass1/stage/SOURCE-SHA256SUMS.txt" "$release_dir/"
-cp -- "$clone/evidence/pass1/stage/ARTIFACT-SHA256SUMS.txt" "$release_dir/"
-cp -- "$clone/evidence/pass1/stage/MANIFEST.txt" "$release_dir/"
+cp -- "$clone/evidence/pass1/stage/SOURCE-SHA256SUMS.txt" "$release_dir/${PROJECT_ID}-SOURCE-SHA256SUMS.txt"
+cp -- "$clone/evidence/pass1/stage/ARTIFACT-SHA256SUMS.txt" "$release_dir/${PROJECT_ID}-ARTIFACT-SHA256SUMS.txt"
+cp -- "$clone/evidence/pass1/stage/MANIFEST.txt" "$release_dir/${PROJECT_ID}-MANIFEST.txt"
 
+release_assets=("$bundle_name" "$bundle_name.sha256"
+  "${PROJECT_ID}-SOURCE-SHA256SUMS.txt"
+  "${PROJECT_ID}-ARTIFACT-SHA256SUMS.txt"
+  "${PROJECT_ID}-MANIFEST.txt")
+for asset in "${release_assets[@]}"; do
+  [[ -f "$release_dir/$asset" ]] || die "missing release asset: $asset"
+done
+[[ "$(find "$release_dir" -maxdepth 1 -type f | wc -l)" -eq "${#release_assets[@]}" ]] || die "unexpected release asset"
+
+printf 'candidate_project_id=%s\n' "$PROJECT_ID"
 printf 'candidate_tag=%s\n' "$tag"
 printf 'candidate_commit=%s\n' "$head"
 printf 'candidate_evidence_sha256=%s\n' "$(sha256_of "$release_dir/$bundle_name")"
