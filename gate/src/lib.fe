@@ -1,77 +1,1090 @@
-// A simple Counter contract to get you started.
-// Run `fe test` to see it in action!
+use core::abi::{ByteInput, ByteSource}
+use core::num::IntDowncast
+use core::ptr::{MemBuffer, MemSlice, MemSpan, MemVec}
+use std::abi::{Bytes, Bytes32, DynArray, dyn_array_from, sol}
+use std::evm::{
+    Address,
+    Call,
+    Ctx,
+    Evm,
+    RawCallOutcome,
+    RawOps,
+    ReturnData,
+    TSlot,
+    Wei,
+    encode_msg_calldata,
+    is_error,
+    keccak256,
+    revert_error,
+    wei,
+}
+use std::evm::calls::has_min_gas
 
-use std::abi::sol
-use std::evm::{Evm, Call}
+const MAX_CALLS: usize = 16
+const MAX_CALL_DATA: usize = 4096
+const MAX_TOTAL_DATA: usize = 32768
+const PREFIX_CAP: usize = 256
+const BETWEEN_CALL_RESERVE: u256 = 100000
+const FINAL_RESERVE: u256 = 500000
+const RETURN_RESERVE: u256 = 250000
+const REFUND_GAS: u256 = 30000
+const ERROR_STRING_SELECTOR: u32 = 0x08c379a0
+const PANIC_SELECTOR: u32 = 0x4e487b71
 
-// Messages define your contract's public interface.
-// Each variant becomes a callable function with a unique selector.
-// The `sol()` const fn computes the standard Solidity selector at compile time.
-msg CounterMsg {
-    #[selector = sol("increment()")]
-    Increment,
-    #[selector = sol("get()")]
-    Get -> u256,
+#[abi]
+pub struct BatchCall { pub target: Address, pub gas_limit: u256, pub value: Wei, pub data: Bytes }
+impl Copy for BatchCall {}
+
+#[abi]
+pub struct CallReport {
+    pub index: u32,
+    pub success: bool,
+    pub class: u8,
+    pub selector_present: bool,
+    pub selector: u32,
+    pub panic_present: bool,
+    pub panic_code: u256,
+    pub returndata_len: u256,
+    pub prefix: Bytes,
+    pub prefix_hash: Bytes32,
+    pub hash_is_complete: bool,
+}
+impl Copy for CallReport {}
+
+msg OutcomeBatchMsg {
+    #[selector = sol("execute((address,uint256,uint256,bytes)[])")]
+    Execute { calls: DynArray<BatchCall> } -> DynArray<CallReport>,
 }
 
-// Storage is defined as a regular struct.
-// Its fields are persisted on-chain between calls.
-struct CounterStore {
-    value: u256,
-}
+#[error]
+pub struct TooManyCalls { pub count: u256 }
+#[error]
+pub struct CallDataTooLarge { pub index: u32, pub length: u256 }
+#[error]
+pub struct TotalDataTooLarge { pub length: u256 }
+#[error]
+pub struct FundingOverflow { pub index: u32 }
+#[error]
+pub struct FundingMismatch { pub expected: u256, pub provided: u256 }
+#[error]
+pub struct SelfValueForbidden { pub index: u32 }
+#[error]
+pub struct ReentrantExecution {}
+#[error]
+pub struct InsufficientBatchGas { pub index: u32 }
+#[error]
+pub struct RefundFailed {}
 
-// The contract itself: declares its storage and handles messages.
-pub contract Counter {
-    mut store: CounterStore
-
-    // The constructor runs once when the contract is deployed.
-    init() uses (mut store) {
-        store.value = 0
+fn saturating_add(_ left: u256, _ right: u256) -> u256 {
+    let maximum = !0 as u256
+    if left > maximum - right {
+        maximum
+    } else {
+        left + right
     }
-
-    // The recv block routes incoming messages to handlers.
-    recv CounterMsg {
-        Increment uses (mut store) {
-            store.value = store.value + 1
-        }
-
-        Get -> u256 uses (store) {
-            store.value
-        }
-    }
 }
 
-// Tests can deploy and interact with contracts.
-// Run with: fe test
-#[test]
-fn test_counter() uses (evm: mut Evm) {
-    // Deploy the contract
-    let addr = evm.create2<Counter>(value: Wei::zero(), args: (), salt: 0)
-    assert!(addr.word() != 0)
-
-    // Initially the counter is 0
-    let val: u256 = evm.call(
-        addr: addr,
-        gas: 100000,
-        value: Wei::zero(),
-        message: CounterMsg::Get {}
+fn admission_requirement(_ minimum: u256, _ reserve: u256) -> u256 {
+    let extra = minimum / 63 + if minimum % 63 == 0 { 0 } else { 1 }
+    saturating_add(
+        40000,
+        saturating_add(minimum, saturating_add(extra, reserve)),
     )
-    assert!(val == 0)
+}
 
-    // Increment the counter
+fn build_reserves(_ calls: MemSlice<BatchCall>) -> [u256; 16] {
+    var reserves: [u256; 16] = [0; 16]
+    var suffix = FINAL_RESERVE
+    var remaining = calls.len()
+    while remaining > 0 {
+        remaining -= 1
+        reserves[remaining] = suffix
+        let current = calls[remaining]
+        suffix = saturating_add(
+            BETWEEN_CALL_RESERVE,
+            admission_requirement(current.gas_limit, suffix),
+        )
+    }
+    reserves
+}
+
+fn validate_batch(_ calls: MemSlice<BatchCall>, _ self_address: Address, _ provided: Wei) {
+    let count = calls.len()
+    if count > MAX_CALLS {
+        revert_error(TooManyCalls { count: count as u256 })
+    }
+
+    var total_data: usize = 0
+    var funding: u256 = 0
+    var index: usize = 0
+    while index < count {
+        let item = calls[index]
+        let data_len = item.data.len()
+        if data_len > MAX_CALL_DATA {
+            revert_error(
+                CallDataTooLarge { index: index.downcast_truncate(), length: data_len as u256 },
+            )
+        }
+        if total_data > MAX_TOTAL_DATA - data_len {
+            revert_error(
+                TotalDataTooLarge { length: total_data as u256 + data_len as u256 },
+            )
+        }
+        total_data += data_len
+
+        let amount = item.value.as_wei()
+        let maximum = !0 as u256
+        if funding > maximum - amount {
+            revert_error(FundingOverflow { index: index.downcast_truncate() })
+        }
+        funding += amount
+        if item.target == self_address && amount != 0 {
+            revert_error(SelfValueForbidden { index: index.downcast_truncate() })
+        }
+        index += 1
+    }
+
+    if funding != provided.as_wei() {
+        revert_error(
+            FundingMismatch { expected: funding, provided: provided.as_wei() },
+        )
+    }
+}
+
+fn valid_error_string(_ data: ReturnData, _ length: u256) -> bool {
+    if length < 68 {
+        return false
+    }
+    let offset = data.word_at(4)
+    if offset > 0xffffffffffffffff || offset > length - 36 {
+        return false
+    }
+    let string_length = data.word_at(4 + offset)
+    if string_length > 0xffffffffffffffff {
+        return false
+    }
+    string_length <= length - offset - 36
+}
+
+fn build_report(_ index: usize, _ outcome: RawCallOutcome, _ ret: own MemBuffer) -> CallReport {
+    let full_length = outcome.returndata_len()
+    let prefix = Bytes::from_payload(source: ret.span())
+    let prefix_hash = Bytes32 { val: keccak256(prefix.payload_span()) }
+
+    var class: u8 = 0
+    var selector_present = false
+    var selector: u32 = 0
+    var panic_present = false
+    var panic_code: u256 = 0
+
+    if full_length >= 4 {
+        selector_present = true
+        selector = (prefix.word_at(0) >> 224) as u32
+    }
+
+    if !outcome.success() {
+        if full_length == 0 {
+            class = 1
+        } else if full_length < 4 {
+            class = 2
+        } else {
+            let live = ReturnData::new()
+            if selector == ERROR_STRING_SELECTOR {
+                class = if valid_error_string(live, full_length) {
+                    3
+                } else {
+                    6
+                }
+            } else if selector == PANIC_SELECTOR {
+                if full_length >= 36 {
+                    class = 4
+                    panic_present = true
+                    panic_code = live.word_at(4)
+                } else {
+                    class = 6
+                }
+            } else {
+                class = 5
+            }
+        }
+    }
+
+    CallReport {
+        index: index.downcast_truncate(),
+        success: outcome.success(),
+        class,
+        selector_present,
+        selector,
+        panic_present,
+        panic_code,
+        returndata_len: full_length,
+        prefix,
+        prefix_hash,
+        hash_is_complete: full_length <= PREFIX_CAP as u256,
+    }
+}
+
+pub contract OutcomeBatch {
+    mut entered: TSlot<bool>,
+
+    init() {}
+
+    recv OutcomeBatchMsg {
+        #[payable]
+        Execute { calls } -> DynArray<CallReport>
+        uses (mut entered, ctx: Ctx, call: mut Call)
+        {
+            if entered.value {
+                revert_error(ReentrantExecution {})
+            }
+
+            let sender = ctx.caller()
+            if calls.len() > MAX_CALLS {
+                revert_error(TooManyCalls { count: calls.len() as u256 })
+            }
+            let materialized = calls.to_mem_array()
+            let items = materialized.as_slice()
+            validate_batch(items, self_address: ctx.address(), provided: ctx.value())
+            let reserves = build_reserves(items)
+            let count = items.len()
+            var reports = MemVec<CallReport>::with_capacity(count)
+            var refund: u256 = 0
+            entered.value = true
+
+            var index: usize = 0
+            while index < count {
+                let item = items[index]
+                let target = item.target
+                let minimum = item.gas_limit
+                let value = item.value
+                let args = item.data.payload_span()
+
+                // Touch the entire bounded output region before gas admission.
+                var ret = MemBuffer::alloc(PREFIX_CAP)
+                ret.truncate(0)
+
+                if !has_min_gas(ctx.gas(), minimum, reserves[index]) {
+                    revert_error(InsufficientBatchGas { index: index.downcast_truncate() })
+                }
+                let outcome = call.raw_call(addr: target, gas: minimum, value, args, ret: mut ret)
+
+                if !outcome.success() {
+                    refund += value.as_wei()
+                }
+                reports.push(build_report(index, outcome, ret))
+                index += 1
+            }
+
+            if refund != 0 {
+                var ignored = MemBuffer::empty()
+                if !has_min_gas(ctx.gas(), REFUND_GAS, RETURN_RESERVE) {
+                    revert_error(RefundFailed {})
+                }
+                let refunded = call
+                    .raw_call(
+                        addr: sender,
+                        gas: REFUND_GAS,
+                        value: wei(refund),
+                        args: MemSpan::empty(),
+                        ret: mut ignored,
+                    )
+                if !refunded.success() {
+                    revert_error(RefundFailed {})
+                }
+            }
+
+            entered.value = false
+            DynArray::from_slice(reports.as_slice())
+        }
+    }
+}
+
+msg RawTargetMsg {
+    #[selector = sol("run()")]
+    Run,
+}
+
+pub contract RawTarget {
+    mut mode: u8,
+    mut word: u256,
+    mut length: u256,
+
+    init(mode_in: u8, word_in: u256, length_in: u256)
+    uses (mut mode, mut word, mut length)
+    {
+        mode = mode_in
+        word = word_in
+        length = length_in
+    }
+
+    recv RawTargetMsg {
+        Run uses (mode, word, length, raw: mut RawOps) {
+            if mode == 2 {
+                let total = if length == 0 { 68 } else { length }
+                let allocation = if total < 68 { 68 } else { total }
+                var encoded = MemBuffer::alloc(allocation as usize)
+                encoded.write_word(offset: 0, value: (ERROR_STRING_SELECTOR as u256) << 224)
+                encoded.write_word(offset: 4, value: 32)
+                encoded.write_word(offset: 36, value: word)
+                encoded.truncate(total as usize)
+                raw.revert(data: encoded.span())
+            }
+            if mode == 3 {
+                let total = if length == 0 { 36 } else { length }
+                let allocation = if total < 36 { 36 } else { total }
+                var encoded = MemBuffer::alloc(allocation as usize)
+                encoded.write_word(offset: 0, value: (PANIC_SELECTOR as u256) << 224)
+                encoded.write_word(offset: 4, value: word)
+                encoded.truncate(total as usize)
+                raw.revert(data: encoded.span())
+            }
+            if mode == 4 {
+                var encoded = MemBuffer::alloc(32)
+                encoded.write_word(offset: 0, value: (ERROR_STRING_SELECTOR as u256) << 224)
+                encoded.truncate(4)
+                raw.revert(data: encoded.span())
+            }
+            if mode == 5 {
+                let allocation = if length < 36 { 36 } else { length }
+                var encoded = MemBuffer::alloc(allocation as usize)
+                encoded.write_word(offset: 0, value: (ERROR_STRING_SELECTOR as u256) << 224)
+                encoded.write_word(offset: 4, value: word)
+                encoded.truncate(length as usize)
+                raw.revert(data: encoded.span())
+            }
+
+            let allocation = if length < 32 { 32 } else { length }
+            var data = MemBuffer::alloc(allocation as usize)
+            data.write_word(offset: 0, value: word)
+            if mode == 0 && length >= 256 {
+                data[255] = 0xa5
+            }
+            if mode == 0 && length >= 257 {
+                data[256] = 0x5a
+            }
+            data.truncate(length as usize)
+            if mode == 1 {
+                raw.revert(data: data.span())
+            }
+            raw.return_data(data: data.span())
+        }
+    }
+}
+
+msg CounterTargetMsg {
+    #[selector = sol("hit()")]
+    Hit -> u256,
+    #[selector = sol("hits()")]
+    Hits -> u256,
+}
+
+pub contract CounterTarget {
+    mut hits: u256,
+
+    init() uses (mut hits) { hits = 0 }
+
+    recv CounterTargetMsg {
+        Hit -> u256 uses (mut hits) {
+            hits += 1
+            hits
+        }
+        Hits -> u256 uses (hits) {
+            hits
+        }
+    }
+}
+
+msg BurnerMsg {
+    #[selector = sol("burn()")]
+    Burn,
+}
+
+pub contract Burner {
+    init() {}
+    recv BurnerMsg {
+        Burn {} {
+            while true {}
+        }
+    }
+}
+
+msg ValueSinkMsg {
+    #[selector = sol("deposit()")]
+    Deposit -> Wei,
+}
+
+pub contract ValueSink uses (ctx: Ctx) {
+    init() {}
+    recv ValueSinkMsg {
+        #[payable]
+        Deposit -> Wei uses (ctx) {
+            ctx.value()
+        }
+    }
+}
+
+msg ReentrantTargetMsg {
+    #[selector = sol("attack()")]
+    Attack -> bool,
+}
+
+pub contract ReentrantTarget {
+    mut batch: Address,
+
+    init(batch_address: Address) uses (mut batch) { batch = batch_address }
+
+    recv ReentrantTargetMsg {
+        Attack -> bool uses (batch, call: mut Call) {
+            let empty_calls: DynArray<BatchCall> = DynArray::empty()
+            let nested = call
+                .try_call(
+                    addr: batch,
+                    gas: 100000,
+                    value: Wei::zero(),
+                    message: OutcomeBatchMsg::Execute { calls: empty_calls },
+                )
+            !nested.success() && is_error<ReentrantExecution>(nested.returndata())
+        }
+    }
+}
+
+msg RefundRejectorMsg {
+    #[selector = sol("launch(address,address,address)")]
+    Launch { batch: Address, target: Address, counter: Address } -> bool,
+}
+
+pub contract RefundRejector {
+    #[payable]
+    init()
+    {}
+
+    recv RefundRejectorMsg {
+        Launch { batch, target, counter } -> bool
+        uses (call: mut Call)
+        {
+            let calls = dyn_array_from(
+                [
+                    make_call(counter, 150000, Wei::zero(), counter_hit_data()),
+                    make_call(target, 150000, wei(5), raw_target_data()),
+                ],
+            )
+            let failed = call
+                .try_call(
+                    addr: batch,
+                    gas: 3000000,
+                    value: wei(5),
+                    message: OutcomeBatchMsg::Execute { calls },
+                )
+            !failed.success() && is_error<RefundFailed>(failed.returndata())
+        }
+    }
+}
+
+msg ValueCallerMsg {
+    #[selector = sol("launch(address,address,address)")]
+    Launch { batch: Address, sink: Address, reverter: Address } -> (bool, bool, u256),
+}
+
+pub contract ValueCaller uses (ctx: Ctx) {
+    #[payable]
+    init()
+    {}
+
+    recv {
+        ValueCallerMsg::Launch { batch, sink, reverter } -> (bool, bool, u256)
+        uses (ctx, call: mut Call)
+        {
+            let calls = dyn_array_from(
+                [
+                    make_call(sink, 150000, wei(13), value_sink_data()),
+                    make_call(reverter, 150000, wei(11), raw_target_data()),
+                ],
+            )
+            let reports: DynArray<CallReport> = call
+                .call(
+                    addr: batch,
+                    gas: 3000000,
+                    value: wei(24),
+                    message: OutcomeBatchMsg::Execute { calls },
+                )
+            (reports.get(0).success, !reports.get(1).success, ctx.selfbalance().as_wei())
+        }
+
+        #[payable]
+        _ {}
+    }
+}
+
+fn raw_target_data() -> Bytes {
+    let encoded = encode_msg_calldata(RawTargetMsg::Run {})
+    Bytes::from_payload(source: encoded.span())
+}
+
+fn counter_hit_data() -> Bytes {
+    let encoded = encode_msg_calldata(CounterTargetMsg::Hit {})
+    Bytes::from_payload(source: encoded.span())
+}
+
+fn burner_data() -> Bytes {
+    let encoded = encode_msg_calldata(BurnerMsg::Burn {})
+    Bytes::from_payload(source: encoded.span())
+}
+
+fn value_sink_data() -> Bytes {
+    let encoded = encode_msg_calldata(ValueSinkMsg::Deposit {})
+    Bytes::from_payload(source: encoded.span())
+}
+
+fn reentrant_data() -> Bytes {
+    let encoded = encode_msg_calldata(ReentrantTargetMsg::Attack {})
+    Bytes::from_payload(source: encoded.span())
+}
+
+fn padded_raw_target_data(_ length: usize) -> Bytes {
+    var padded = MemBuffer::alloc(length)
+    let encoded = encode_msg_calldata(RawTargetMsg::Run {})
+    padded.copy_from(dest_offset: 0, source: encoded.span())
+    Bytes::from_payload(source: padded.span())
+}
+
+fn make_call(_ target: Address, _ gas_limit: u256, _ value: Wei, _ data: Bytes) -> BatchCall {
+    BatchCall { target, gas_limit, value, data }
+}
+
+fn deploy_batch(_ salt: u256) -> Address uses (evm: mut Evm) {
+    let address = evm.create2<OutcomeBatch>(value: Wei::zero(), args: (), salt)
+    assert!(address != Address::zero())
+    address
+}
+
+fn deploy_raw(_ mode: u8, _ word: u256, _ length: u256, _ salt: u256) -> Address
+uses (evm: mut Evm)
+{
+    let address = evm.create2<RawTarget>(value: Wei::zero(), args: (mode, word, length), salt)
+    assert!(address != Address::zero())
+    address
+}
+
+fn execute_calls(_ batch: Address, _ calls: DynArray<BatchCall>, _ value: Wei) -> DynArray<
+    CallReport,
+>
+uses (evm: mut Evm)
+{
     evm.call(
-        addr: addr,
-        gas: 100000,
-        value: Wei::zero(),
-        message: CounterMsg::Increment {}
+        addr: batch,
+        gas: 15000000,
+        value,
+        message: OutcomeBatchMsg::Execute { calls },
+    )
+}
+
+#[test]
+fn classification_boundaries() uses (evm: mut Evm) {
+    let batch = deploy_batch(1)
+    let success_error_shape = deploy_raw(
+        0,
+        word: (ERROR_STRING_SELECTOR as u256) << 224,
+        length: 68,
+        salt: 2,
+    )
+    let empty_failure = deploy_raw(1, word: 0, length: 0, salt: 3)
+    let short_failure = deploy_raw(1, word: 0xaabbcc << 232, length: 3, salt: 4)
+    let valid_error = deploy_raw(2, word: 0, length: 0, salt: 5)
+    let valid_panic = deploy_raw(3, word: 0x11, length: 0, salt: 6)
+    let unknown = deploy_raw(1, word: 0xdeadbeef << 224, length: 4, salt: 7)
+    let malformed_error = deploy_raw(4, word: 0, length: 0, salt: 8)
+
+    let calls = dyn_array_from(
+        [
+            make_call(
+                success_error_shape,
+                300000,
+                Wei::zero(),
+                raw_target_data(),
+            ),
+            make_call(empty_failure, 300000, Wei::zero(), raw_target_data()),
+            make_call(short_failure, 300000, Wei::zero(), raw_target_data()),
+            make_call(valid_error, 300000, Wei::zero(), raw_target_data()),
+            make_call(valid_panic, 300000, Wei::zero(), raw_target_data()),
+            make_call(unknown, 300000, Wei::zero(), raw_target_data()),
+            make_call(malformed_error, 300000, Wei::zero(), raw_target_data()),
+        ],
+    )
+    let reports = execute_calls(batch, calls, Wei::zero())
+    assert!(reports.len() == 7)
+
+    let success = reports.get(0)
+    assert!(
+        success.index == 0 && success.success && success.class == 0,
+    )
+    assert!(
+        success.selector_present && success.selector == ERROR_STRING_SELECTOR,
+    )
+    assert!(!success.panic_present)
+    assert!(success.returndata_len == 68 && success.hash_is_complete)
+
+    let empty = reports.get(1)
+    assert!(
+        !empty.success && empty.class == 1 && !empty.selector_present,
+    )
+    assert!(empty.returndata_len == 0 && empty.prefix.len() == 0)
+
+    let short = reports.get(2)
+    assert!(
+        !short.success && short.class == 2 && !short.selector_present,
+    )
+    assert!(short.returndata_len == 3 && short.prefix.len() == 3)
+
+    let error = reports.get(3)
+    assert!(!error.success && error.class == 3)
+    assert!(
+        error.selector_present && error.selector == ERROR_STRING_SELECTOR,
+    )
+    assert!(!error.panic_present)
+
+    let panic = reports.get(4)
+    assert!(!panic.success && panic.class == 4)
+    assert!(panic.selector_present && panic.selector == PANIC_SELECTOR)
+    assert!(panic.panic_present && panic.panic_code == 0x11)
+
+    let custom = reports.get(5)
+    assert!(!custom.success && custom.class == 5)
+    assert!(custom.selector_present && custom.selector == 0xdeadbeef)
+
+    let malformed = reports.get(6)
+    assert!(!malformed.success && malformed.class == 6)
+    assert!(
+        malformed.selector_present && malformed.selector == ERROR_STRING_SELECTOR,
+    )
+    assert!(
+        malformed.prefix_hash.val == keccak256(malformed.prefix.payload_span()),
+    )
+}
+
+#[test]
+fn standard_error_and_panic_boundaries() uses (evm: mut Evm) {
+    let batch = deploy_batch(9)
+    let success_short = deploy_raw(0, word: 0xaabb << 240, length: 2, salt: 10)
+    let error_67 = deploy_raw(2, word: 0, length: 67, salt: 11)
+    let error_68 = deploy_raw(2, word: 0, length: 68, salt: 12)
+    let error_long = deploy_raw(2, word: 300, length: 368, salt: 13)
+    let error_bad_offset = deploy_raw(5, word: 64, length: 68, salt: 14)
+    let error_far_offset = deploy_raw(5, word: 288, length: 324, salt: 18)
+    let panic_35 = deploy_raw(3, word: 0x11, length: 35, salt: 15)
+    let panic_36 = deploy_raw(3, word: 0x12, length: 36, salt: 16)
+    let dispatch_target = evm.create2<CounterTarget>(value: Wei::zero(), args: (), salt: 17)
+    let unknown_selector = Bytes::from_word_prefix(word: 0x12345678 << 224, len: 4)
+
+    let reports = execute_calls(
+        batch,
+        dyn_array_from(
+            [
+                make_call(success_short, 300000, Wei::zero(), raw_target_data()),
+                make_call(error_67, 300000, Wei::zero(), raw_target_data()),
+                make_call(error_68, 300000, Wei::zero(), raw_target_data()),
+                make_call(error_long, 300000, Wei::zero(), raw_target_data()),
+                make_call(error_bad_offset, 300000, Wei::zero(), raw_target_data()),
+                make_call(error_far_offset, 300000, Wei::zero(), raw_target_data()),
+                make_call(panic_35, 300000, Wei::zero(), raw_target_data()),
+                make_call(panic_36, 300000, Wei::zero(), raw_target_data()),
+                make_call(dispatch_target, 300000, Wei::zero(), unknown_selector),
+            ],
+        ),
+        Wei::zero(),
+    )
+    assert!(reports.len() == 9)
+
+    let short_success = reports.get(0)
+    assert!(short_success.success && short_success.class == 0)
+    assert!(
+        short_success.returndata_len == 2 && !short_success.selector_present,
     )
 
-    // Now it should be 1
-    let val: u256 = evm.call(
-        addr: addr,
-        gas: 100000,
-        value: Wei::zero(),
-        message: CounterMsg::Get {}
+    let short_error = reports.get(1)
+    assert!(!short_error.success && short_error.class == 6)
+    assert!(short_error.selector == ERROR_STRING_SELECTOR)
+
+    let exact_error = reports.get(2)
+    assert!(!exact_error.success && exact_error.class == 3)
+    assert!(
+        exact_error.returndata_len == 68 && exact_error.hash_is_complete,
     )
-    assert!(val == 1)
+
+    let long_error = reports.get(3)
+    assert!(!long_error.success && long_error.class == 3)
+    assert!(
+        long_error.returndata_len == 368 && long_error.prefix.len() == PREFIX_CAP,
+    )
+    assert!(!long_error.hash_is_complete)
+
+    let bad_offset = reports.get(4)
+    assert!(!bad_offset.success && bad_offset.class == 6)
+    assert!(bad_offset.selector == ERROR_STRING_SELECTOR)
+
+    let far_offset = reports.get(5)
+    assert!(!far_offset.success && far_offset.class == 3)
+    assert!(far_offset.returndata_len == 324)
+    assert!(
+        far_offset.prefix.len() == PREFIX_CAP && !far_offset.hash_is_complete,
+    )
+
+    let short_panic = reports.get(6)
+    assert!(!short_panic.success && short_panic.class == 6)
+    assert!(
+        short_panic.selector == PANIC_SELECTOR && !short_panic.panic_present,
+    )
+
+    let exact_panic = reports.get(7)
+    assert!(!exact_panic.success && exact_panic.class == 4)
+    assert!(
+        exact_panic.panic_present && exact_panic.panic_code == 0x12,
+    )
+
+    let no_handler = reports.get(8)
+    assert!(!no_handler.success && no_handler.class == 1)
+    assert!(
+        no_handler.returndata_len == 0 && !no_handler.selector_present,
+    )
+}
+
+#[test]
+fn call_count_and_data_caps() uses (evm: mut Evm) {
+    let batch = deploy_batch(20)
+    let target = deploy_raw(0, word: 1, length: 32, salt: 21)
+    let normal = make_call(target, 100000, Wei::zero(), raw_target_data())
+
+    let sixteen = dyn_array_from([normal; 16])
+    let reports = execute_calls(batch, sixteen, Wei::zero())
+    assert!(reports.len() == 16)
+    for report in reports {
+        assert!(report.success && report.class == 0)
+    }
+
+    let seventeen = dyn_array_from([normal; 17])
+    let rejected_count = evm
+        .try_call(
+            addr: batch,
+            gas: 15000000,
+            value: Wei::zero(),
+            message: OutcomeBatchMsg::Execute { calls: seventeen },
+        )
+    assert!(
+        !rejected_count.success() && is_error<TooManyCalls>(rejected_count.returndata()),
+    )
+
+    let exact_data = make_call(
+        target,
+        100000,
+        Wei::zero(),
+        padded_raw_target_data(MAX_CALL_DATA),
+    )
+    let exact_report = execute_calls(batch, dyn_array_from([exact_data]), Wei::zero())
+    assert!(exact_report.len() == 1)
+    assert!(exact_report.get(0).success)
+
+    let oversized = make_call(
+        target,
+        100000,
+        Wei::zero(),
+        padded_raw_target_data(MAX_CALL_DATA + 1),
+    )
+    let rejected_item = evm
+        .try_call(
+            addr: batch,
+            gas: 15000000,
+            value: Wei::zero(),
+            message: OutcomeBatchMsg::Execute { calls: dyn_array_from([oversized]) },
+        )
+    assert!(
+        !rejected_item.success() && is_error<CallDataTooLarge>(rejected_item.returndata()),
+    )
+
+    let exact_total = dyn_array_from([exact_data; 8])
+    let total_reports = execute_calls(batch, exact_total, Wei::zero())
+    assert!(total_reports.len() == 8)
+    for report in total_reports {
+        assert!(report.success)
+    }
+
+    let one_byte_buffer = MemBuffer::alloc(1)
+    let one_byte = make_call(
+        target,
+        100000,
+        Wei::zero(),
+        Bytes::from_payload(source: one_byte_buffer.span()),
+    )
+    let over_total = dyn_array_from(
+        [
+            exact_data,
+            exact_data,
+            exact_data,
+            exact_data,
+            exact_data,
+            exact_data,
+            exact_data,
+            exact_data,
+            one_byte,
+        ],
+    )
+    let rejected_total = evm
+        .try_call(
+            addr: batch,
+            gas: 15000000,
+            value: Wei::zero(),
+            message: OutcomeBatchMsg::Execute { calls: over_total },
+        )
+    assert!(
+        !rejected_total.success() && is_error<TotalDataTooLarge>(rejected_total.returndata()),
+    )
+}
+
+#[test]
+fn failure_continues_and_suffix_gas_is_preserved() uses (evm: mut Evm) {
+    let batch = deploy_batch(30)
+    let burner = evm.create2<Burner>(value: Wei::zero(), args: (), salt: 31)
+    let counter = evm.create2<CounterTarget>(value: Wei::zero(), args: (), salt: 32)
+    assert!(burner != Address::zero() && counter != Address::zero())
+
+    let calls = dyn_array_from(
+        [
+            make_call(burner, 100000, Wei::zero(), burner_data()),
+            make_call(counter, 100000, Wei::zero(), counter_hit_data()),
+        ],
+    )
+    let reports = execute_calls(batch, calls, Wei::zero())
+    assert!(reports.len() == 2)
+    assert!(!reports.get(0).success && reports.get(0).class == 1)
+    assert!(reports.get(1).success && reports.get(1).class == 0)
+    assert!(reports.get(1).prefix.word_at(0) == 1)
+
+    let hits: u256 = evm
+        .call(
+            addr: counter,
+            gas: 100000,
+            value: Wei::zero(),
+            message: CounterTargetMsg::Hits {},
+        )
+    assert!(hits == 1)
+
+    let impossible = dyn_array_from(
+        [make_call(counter, 10000000, Wei::zero(), counter_hit_data())],
+    )
+    let rejected = evm
+        .try_call(
+            addr: batch,
+            gas: 300000,
+            value: Wei::zero(),
+            message: OutcomeBatchMsg::Execute { calls: impossible },
+        )
+    assert!(
+        !rejected.success() && is_error<InsufficientBatchGas>(rejected.returndata()),
+    )
+    let hits_after: u256 = evm
+        .call(
+            addr: counter,
+            gas: 100000,
+            value: Wei::zero(),
+            message: CounterTargetMsg::Hits {},
+        )
+    assert!(hits_after == 1)
+}
+
+#[test]
+fn return_bomb_is_capped() uses (evm: mut Evm) {
+    let batch = deploy_batch(40)
+    let exact = deploy_raw(0, word: 0xabcdef << 232, length: 256, salt: 41)
+    let one_over = deploy_raw(0, word: 0xabcdef << 232, length: 257, salt: 42)
+    let bomb = deploy_raw(0, word: 0xabcdef << 232, length: 0x100000, salt: 43)
+    let reports = execute_calls(
+        batch,
+        dyn_array_from(
+            [
+                make_call(exact, 200000, Wei::zero(), raw_target_data()),
+                make_call(one_over, 200000, Wei::zero(), raw_target_data()),
+                make_call(bomb, 5000000, Wei::zero(), raw_target_data()),
+            ],
+        ),
+        Wei::zero(),
+    )
+    assert!(reports.len() == 3)
+    var expected_prefix = MemBuffer::alloc(PREFIX_CAP)
+    expected_prefix.write_word(offset: 0, value: 0xabcdef << 232)
+    expected_prefix[255] = 0xa5
+    let expected_hash = keccak256(expected_prefix.span())
+
+    let exact_report = reports.get(0)
+    assert!(exact_report.success && exact_report.returndata_len == 256)
+    assert!(
+        exact_report.prefix.len() == 256 && exact_report.hash_is_complete,
+    )
+    assert!(exact_report.prefix.byte_at(255) == 0xa5)
+    assert!(exact_report.prefix_hash.val == expected_hash)
+
+    let over_report = reports.get(1)
+    assert!(over_report.success && over_report.returndata_len == 257)
+    assert!(
+        over_report.prefix.len() == PREFIX_CAP && !over_report.hash_is_complete,
+    )
+    assert!(over_report.prefix.byte_at(255) == 0xa5)
+    assert!(over_report.prefix_hash.val == expected_hash)
+
+    let bomb_report = reports.get(2)
+    assert!(bomb_report.success && bomb_report.class == 0)
+    assert!(bomb_report.returndata_len == 0x100000)
+    assert!(bomb_report.prefix.len() == PREFIX_CAP)
+    assert!(!bomb_report.hash_is_complete)
+    assert!(bomb_report.prefix.byte_at(255) == 0xa5)
+    assert!(bomb_report.prefix_hash.val == expected_hash)
+}
+
+#[test]
+fn maximum_report_abi_has_exact_sizes() uses (evm: mut Evm) {
+    let batch = deploy_batch(50)
+    let target = deploy_raw(
+        0,
+        word: 0x1234 << 240,
+        length: PREFIX_CAP as u256,
+        salt: 51,
+    )
+    let item = make_call(target, 150000, Wei::zero(), raw_target_data())
+    let calls = dyn_array_from([item; 16])
+
+    let typed = execute_calls(batch, calls, Wei::zero())
+    assert!(typed.len() == 16)
+    assert!(typed.encoded_size() == 10784)
+    assert!(typed.get(15).prefix.len() == PREFIX_CAP)
+
+    let encoded = encode_msg_calldata(OutcomeBatchMsg::Execute { calls })
+    var output = MemBuffer::alloc(96)
+    output.truncate(0)
+    let raw = evm
+        .raw_call(
+            addr: batch,
+            gas: 15000000,
+            value: Wei::zero(),
+            args: encoded.span(),
+            ret: mut output,
+        )
+    assert!(raw.success() && raw.returndata_len() == 10816)
+    assert!(output.len() == 96)
+    let live = ReturnData::new()
+    assert!(live.len() == 10816)
+    assert!(live.word_at(0) == 0x20)
+    assert!(live.word_at(32) == 16)
+    assert!(live.word_at(64) == 0x200)
+}
+
+#[test(balance = 1000)]
+fn exact_funding_self_value_and_refund() uses (evm: mut Evm) {
+    let batch = deploy_batch(60)
+    let sink = evm.create2<ValueSink>(value: Wei::zero(), args: (), salt: 61)
+    let reverter = deploy_raw(1, word: 0, length: 0, salt: 62)
+
+    let paid = execute_calls(
+        batch,
+        dyn_array_from([make_call(sink, 150000, wei(7), value_sink_data())]),
+        wei(7),
+    )
+    assert!(paid.get(0).success)
+    assert!(evm.balance(sink) == wei(7))
+    assert!(evm.balance(batch) == Wei::zero())
+
+    let mismatch = evm
+        .try_call(
+            addr: batch,
+            gas: 1000000,
+            value: wei(4),
+            message: OutcomeBatchMsg::Execute {
+                calls: dyn_array_from([make_call(sink, 150000, wei(5), value_sink_data())]),
+            },
+        )
+    assert!(
+        !mismatch.success() && is_error<FundingMismatch>(mismatch.returndata()),
+    )
+    assert!(evm.balance(sink) == wei(7))
+    assert!(evm.balance(batch) == Wei::zero())
+
+    let self_value = evm
+        .try_call(
+            addr: batch,
+            gas: 1000000,
+            value: wei(1),
+            message: OutcomeBatchMsg::Execute {
+                calls: dyn_array_from([make_call(batch, 150000, wei(1), Bytes::empty())]),
+            },
+        )
+    assert!(
+        !self_value.success() && is_error<SelfValueForbidden>(self_value.returndata()),
+    )
+    assert!(evm.balance(batch) == Wei::zero())
+
+    let caller = evm.create2<ValueCaller>(value: wei(30), args: (), salt: 63)
+    let refunded: (bool, bool, u256) = evm
+        .call(
+            addr: caller,
+            gas: 5000000,
+            value: Wei::zero(),
+            message: ValueCallerMsg::Launch { batch, sink, reverter },
+        )
+    assert!(refunded.0 && refunded.1)
+    assert!(refunded.2 == 17)
+    assert!(evm.balance(caller) == wei(17))
+    assert!(evm.balance(sink) == wei(20))
+    assert!(evm.balance(reverter) == Wei::zero())
+    assert!(evm.balance(batch) == Wei::zero())
+}
+
+#[test(balance = 100)]
+fn failed_refund_reverts_all_effects() uses (evm: mut Evm) {
+    let batch = deploy_batch(65)
+    let reverter = deploy_raw(1, word: 0, length: 0, salt: 66)
+    let counter = evm.create2<CounterTarget>(value: Wei::zero(), args: (), salt: 68)
+    assert!(counter != Address::zero())
+    let rejector = evm.create2<RefundRejector>(value: wei(5), args: (), salt: 67)
+    assert!(rejector != Address::zero())
+
+    let saw_refund_failure: bool = evm
+        .call(
+            addr: rejector,
+            gas: 5000000,
+            value: Wei::zero(),
+            message: RefundRejectorMsg::Launch { batch, target: reverter, counter },
+        )
+    assert!(saw_refund_failure)
+    assert!(evm.balance(rejector) == wei(5))
+    assert!(evm.balance(reverter) == Wei::zero())
+    assert!(evm.balance(batch) == Wei::zero())
+    let hits: u256 = evm
+        .call(
+            addr: counter,
+            gas: 100000,
+            value: Wei::zero(),
+            message: CounterTargetMsg::Hits {},
+        )
+    assert!(hits == 0)
+
+    let empty: DynArray<BatchCall> = DynArray::empty()
+    let after = execute_calls(batch, empty, Wei::zero())
+    assert!(after.len() == 0)
+}
+
+#[test]
+fn transient_guard_blocks_nested_execute_and_clears() uses (evm: mut Evm) {
+    let batch = deploy_batch(70)
+    let attacker = evm.create2<ReentrantTarget>(value: Wei::zero(), args: (batch,), salt: 71)
+    let reports = execute_calls(
+        batch,
+        dyn_array_from(
+            [make_call(attacker, 500000, Wei::zero(), reentrant_data())],
+        ),
+        Wei::zero(),
+    )
+    let report = reports.get(0)
+    assert!(report.success && report.class == 0)
+    assert!(report.returndata_len == 32)
+    assert!(report.prefix.word_at(0) == 1)
+
+    let empty: DynArray<BatchCall> = DynArray::empty()
+    let after = execute_calls(batch, empty, Wei::zero())
+    assert!(after.len() == 0)
 }
